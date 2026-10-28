@@ -126,13 +126,14 @@ private enum LabKey {
     static let rightSpacing = "lab.right.spacing"
     static let rightMargin = "lab.right.margin"
     static let rightBottom = "lab.right.bottom"
+    static let rightEdge = "lab.right.edge"
     static let bottomMinimize = "lab.bottom.minimize"
     static let appearance = "lab.appearance"
 
     static let all = [
         groupImpl, sideImpl, groupCount, keepSingle, groupScale, slotWidth,
         sideScale, sideMargin, nearGroup, edgeEffect, transparentBars,
-        rightMaterial, rightScale, rightSpacing, rightMargin, rightBottom,
+        rightMaterial, rightScale, rightSpacing, rightMargin, rightBottom, rightEdge,
         bottomMinimize, appearance,
     ]
 }
@@ -203,6 +204,10 @@ private enum LabSettings {
     static var rightSpacing: CGFloat { CGFloat(labClamp(number(LabKey.rightSpacing, 14), 0, 30)) }
     static var rightMargin: CGFloat { CGFloat(labClamp(number(LabKey.rightMargin, 10), 0, 40)) }
     static var rightBottom: CGFloat { CGFloat(labClamp(number(LabKey.rightBottom, 24), 0, 200)) }
+    /// The right column as an edge element of the feed's right edge, as the
+    /// top chrome is for the top edge: 0 not registered, 1 registered with
+    /// the edge effect hidden, 2 automatic, 3 soft, 4 hard.
+    static var rightEdge: Int { labClamp(integer(LabKey.rightEdge, 2), 0, 4) }
     static var bottomMinimize: Bool { flag(LabKey.bottomMinimize, true) }
     /// 0 follow system, 1 dark, 2 light.
     static var appearance: Int { labClamp(integer(LabKey.appearance, 1), 0, 2) }
@@ -251,8 +256,14 @@ private enum LabGlass {
     /// The scroll view's top edge effect (iOS 26): 0 hidden, 1 automatic,
     /// 2 soft, 3 hard.
     static func configureTopEdgeEffect(_ scrollView: UIScrollView, mode: Int) {
-        guard scrollView.responds(to: NSSelectorFromString("topEdgeEffect")),
-              let effect = scrollView.value(forKey: "topEdgeEffect") as? NSObject
+        configureEdgeEffect(scrollView, edge: "top", mode: mode)
+    }
+
+    /// One of the scroll view's edge effects ("top", "right", …), same modes.
+    static func configureEdgeEffect(_ scrollView: UIScrollView, edge: String, mode: Int) {
+        let key = edge + "EdgeEffect"
+        guard scrollView.responds(to: NSSelectorFromString(key)),
+              let effect = scrollView.value(forKey: key) as? NSObject
         else {
             return
         }
@@ -274,6 +285,10 @@ private enum LabGlass {
     /// the top chrome sits over its top edge, so UIKit draws one edge effect
     /// behind it, as it does under a navigation bar.
     static func makeTopEdgeContainerInteraction(for scrollView: UIScrollView) -> UIInteraction? {
+        makeEdgeContainerInteraction(for: scrollView, edge: .top)
+    }
+
+    static func makeEdgeContainerInteraction(for scrollView: UIScrollView, edge: UIRectEdge) -> UIInteraction? {
         guard let type = NSClassFromString("UIScrollEdgeElementContainerInteraction") as? NSObject.Type else {
             return nil
         }
@@ -285,7 +300,7 @@ private enum LabGlass {
             return nil
         }
         object.setValue(scrollView, forKey: "scrollView")
-        object.setValue(UIRectEdge.top.rawValue, forKey: "edge")
+        object.setValue(edge.rawValue, forKey: "edge")
         return interaction
     }
 
@@ -468,7 +483,13 @@ private final class BarGlassCircle: UIView, LabCircle {
     private var tint: UIColor
     private var imageKey: (scale: CGFloat, tint: UIColor)?
 
-    init(symbol: String, pointSize: CGFloat, tint: UIColor = .label, action: (() -> Void)? = nil) {
+    init(
+        symbol: String,
+        pointSize: CGFloat,
+        tint: UIColor = .label,
+        transparentBackground: Bool = false,
+        action: (() -> Void)? = nil
+    ) {
         self.symbol = symbol
         self.pointSize = pointSize
         self.tint = tint
@@ -480,6 +501,13 @@ private final class BarGlassCircle: UIView, LabCircle {
         backgroundColor = .clear
         bar.tintColor = .label
         bar.directionalLayoutMargins = .zero
+        if transparentBackground {
+            let appearance = UINavigationBarAppearance()
+            appearance.configureWithTransparentBackground()
+            bar.standardAppearance = appearance
+            bar.scrollEdgeAppearance = appearance
+            bar.compactAppearance = appearance
+        }
         let navigationItem = UINavigationItem(title: "")
         navigationItem.leftBarButtonItem = item
         bar.setItems([navigationItem], animated: false)
@@ -1340,6 +1368,7 @@ private final class ActionColumnView: UIView {
                     symbol: spec.symbol,
                     pointSize: spec.pointSize * scale,
                     tint: tint,
+                    transparentBackground: LabSettings.transparentBars,
                     action: action
                 )
             }
@@ -1523,6 +1552,7 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
     private let topChrome = TopChromeView()
     private let actions = ActionColumnView()
     private var edgeInteraction: UIInteraction?
+    private var rightEdgeInteraction: UIInteraction?
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -1637,6 +1667,8 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             view.setNeedsLayout()
         case LabKey.edgeEffect:
             applyEdgeEffect()
+        case LabKey.rightEdge:
+            applyRightEdge()
         case LabKey.bottomMinimize:
             applyBottomMinimize()
         case LabKey.appearance:
@@ -1669,9 +1701,28 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         topChrome.rebuild()
         actions.rebuild()
         applyEdgeEffect()
+        applyRightEdge()
         applyBottomMinimize()
         applyAppearance()
         view.setNeedsLayout()
+    }
+
+    /// The top chrome only gets the glass that follows the system setting
+    /// while it is the feed's top edge element; the right column gets the
+    /// same registration for the right edge.
+    private func applyRightEdge() {
+        let mode = LabSettings.rightEdge
+        LabGlass.configureEdgeEffect(feed, edge: "right", mode: max(0, mode - 1))
+        if mode == 0 {
+            if let rightEdgeInteraction {
+                actions.removeInteraction(rightEdgeInteraction)
+            }
+            rightEdgeInteraction = nil
+        } else if rightEdgeInteraction == nil,
+                  let interaction = LabGlass.makeEdgeContainerInteraction(for: feed, edge: .right) {
+            actions.addInteraction(interaction)
+            rightEdgeInteraction = interaction
+        }
     }
 
     private func applyEdgeEffect() {
@@ -1903,6 +1954,11 @@ private final class LabSettingsViewController: UIViewController {
             items: ["按钮R", "按钮C", "视图R", "视图C", "栏按钮"],
             selected: LabSettings.rightMaterial
         ) { LabSettings.store($0, LabKey.rightMaterial) })
+        stack.addArrangedSubview(segmentRow(
+            "右侧边缘元素（同顶部边缘效果）",
+            items: ["不登记", "登记不画", "自动", "软", "硬"],
+            selected: LabSettings.rightEdge
+        ) { LabSettings.store($0, LabKey.rightEdge) })
         stack.addArrangedSubview(sliderRow(
             "整体缩放（真实尺寸）",
             value: Double(LabSettings.rightScale),
