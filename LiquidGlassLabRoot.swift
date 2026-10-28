@@ -119,7 +119,7 @@ private enum LabKey {
     static let sideScale = "lab.top.sideScale"
     static let sideMargin = "lab.top.sideMargin"
     static let nearGroup = "lab.top.nearGroup"
-    static let edgeEffect = "lab.top.edgeEffect"
+    static let edgeEffect = "lab.top.edge"
     static let transparentBars = "lab.top.transparentBars"
     static let rightMaterial = "lab.right.material"
     static let rightScale = "lab.right.scale"
@@ -193,8 +193,12 @@ private enum LabSettings {
     static var sideScale: CGFloat { CGFloat(labClamp(number(LabKey.sideScale, 1.0), 0.6, 1.3)) }
     static var sideMargin: CGFloat { CGFloat(labClamp(number(LabKey.sideMargin, 16), 0, 40)) }
     static var nearGroup: Bool { flag(LabKey.nearGroup, false) }
-    /// 0 hidden, 1 automatic, 2 soft, 3 hard.
-    static var edgeEffect: Int { labClamp(integer(LabKey.edgeEffect, 0), 0, 3) }
+    /// The top chrome as an edge element of the feed's top edge: 0 not
+    /// registered, 1 registered with the edge effect hidden, 2 automatic,
+    /// 3 soft, 4 hard. Registered, its bar glass follows the system Liquid
+    /// Glass setting (Clear / Tinted) like the tab bar; the visible effect
+    /// is not needed for that, so 1 is the default.
+    static var edgeEffect: Int { labClamp(integer(LabKey.edgeEffect, 1), 0, 4) }
     static var transparentBars: Bool { flag(LabKey.transparentBars, false) }
     /// 0 glass button Regular, 1 glass button Clear, 2 glass view Regular,
     /// 3 glass view Clear, 4 navigation bar item (bar glass, follows the
@@ -204,10 +208,9 @@ private enum LabSettings {
     static var rightSpacing: CGFloat { CGFloat(labClamp(number(LabKey.rightSpacing, 14), 0, 30)) }
     static var rightMargin: CGFloat { CGFloat(labClamp(number(LabKey.rightMargin, 10), 0, 40)) }
     static var rightBottom: CGFloat { CGFloat(labClamp(number(LabKey.rightBottom, 24), 0, 200)) }
-    /// The right column as an edge element of the feed's right edge, as the
-    /// top chrome is for the top edge: 0 not registered, 1 registered with
-    /// the edge effect hidden, 2 automatic, 3 soft, 4 hard.
-    static var rightEdge: Int { labClamp(integer(LabKey.rightEdge, 2), 0, 4) }
+    /// The right column as an edge element of the feed's right edge, same
+    /// modes and default as the top chrome (`edgeEffect`).
+    static var rightEdge: Int { labClamp(integer(LabKey.rightEdge, 1), 0, 4) }
     static var bottomMinimize: Bool { flag(LabKey.bottomMinimize, true) }
     /// 0 follow system, 1 dark, 2 light.
     static var appearance: Int { labClamp(integer(LabKey.appearance, 1), 0, 2) }
@@ -1727,7 +1730,7 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
 
     private func applyEdgeEffect() {
         let mode = LabSettings.edgeEffect
-        LabGlass.configureTopEdgeEffect(feed, mode: mode)
+        LabGlass.configureTopEdgeEffect(feed, mode: max(0, mode - 1))
         if mode == 0 {
             if let edgeInteraction {
                 topChrome.removeInteraction(edgeInteraction)
@@ -1939,8 +1942,8 @@ private final class LabSettingsViewController: UIViewController {
 
         stack.addArrangedSubview(header("顶部背景"))
         stack.addArrangedSubview(segmentRow(
-            "顶部边缘效果",
-            items: ["隐藏", "自动", "软", "硬"],
+            "顶部边缘元素",
+            items: ["不登记", "登记不画", "自动", "软", "硬"],
             selected: LabSettings.edgeEffect
         ) { LabSettings.store($0, LabKey.edgeEffect) })
         stack.addArrangedSubview(switchRow(
@@ -2183,9 +2186,7 @@ private final class LabProbe {
         .appendingPathComponent("probe.busy")
 
     static var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: enabledKey) == nil
-            ? true
-            : UserDefaults.standard.bool(forKey: enabledKey)
+        UserDefaults.standard.bool(forKey: enabledKey)
     }
 
     /// Called on the main queue after each new log line.
