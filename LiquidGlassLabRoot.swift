@@ -1463,6 +1463,14 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         )
         recoverFromCrashedRebuildIfNeeded()
         applyAll()
+
+        // The right column's glass buttons keep the light/dark look they were
+        // built with; the bars follow a later style change, these do not. So
+        // rebuild them whenever the style changes (setting or system).
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _: UITraitCollection) in
+            self.actions.rebuild()
+            self.view.setNeedsLayout()
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {

@@ -37,6 +37,12 @@ static UIViewController *LGLMakeRootViewController(void) {
     if (![scene isKindOfClass:UIWindowScene.class]) return;
     UIWindow *window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene *)scene];
     window.backgroundColor = UIColor.blackColor;
+    // Apply the lab's light/dark setting before any glass is built (same
+    // mapping as applyAppearance() in LiquidGlassLabRoot.swift; default dark).
+    id appearance = [NSUserDefaults.standardUserDefaults objectForKey:@"lab.appearance"];
+    NSInteger style = appearance ? [appearance integerValue] : 1;
+    window.overrideUserInterfaceStyle = style == 1 ? UIUserInterfaceStyleDark
+        : style == 2 ? UIUserInterfaceStyleLight : UIUserInterfaceStyleUnspecified;
     window.rootViewController = LGLMakeRootViewController();
     self.window = window;
     [window makeKeyAndVisible];
