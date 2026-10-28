@@ -1,0 +1,9 @@
+Package: com.xyy.liquidglasslab
+Name: LiquidGlassLab
+Version: 0.4.0
+Architecture: iphoneos-arm64
+Description: Douyin-like home lab: native top category group with left/right buttons and a scalable right action column, over the 0.3.4 native tab bar.
+Maintainer: xyy
+Author: xyy
+Section: Development
+Depends: firmware (>= 26.0)

@@ -1,0 +1,1 @@
+cd /var/mobile && unzip -oq LiquidGlassLab_0.4.0_full_project.zip -d LiquidGlassLab_0.4.0 && cd LiquidGlassLab_0.4.0 && bash push_to_github.sh

@@ -1,0 +1,85 @@
+name: Build LiquidGlassLab 0.4.0
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [liquidglasslab]
+    paths-ignore:
+      - "README.md"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Show Xcode and iPhone SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
+          echo "iPhoneOS SDK: $SDK_VERSION"
+          MAJOR="${SDK_VERSION%%.*}"
+          [ "$MAJOR" -ge 26 ]
+
+      - name: Typecheck Swift against the iPhone SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          xcrun --sdk iphoneos swiftc -typecheck -swift-version 5 -parse-as-library \
+            -target arm64-apple-ios26.0 -sdk "$SDK_PATH" LiquidGlassLabRoot.swift
+
+      - name: Syntax-check Objective-C entry
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDK_PATH="$(xcrun --sdk iphoneos --show-sdk-path)"
+          for SOURCE in main.m AppDelegate.m SceneDelegate.m; do
+            xcrun --sdk iphoneos clang -target arm64-apple-ios26.0 -isysroot "$SDK_PATH" \
+              -fobjc-arc -fsyntax-only -Wall -Wno-deprecated-declarations -I. "$SOURCE"
+          done
+
+      - name: Install packaging dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install ldid dpkg
+
+      - name: Install Theos
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+
+      - name: Build app and rootless package
+        shell: bash
+        run: |
+          set -euo pipefail
+          export THEOS="$RUNNER_TEMP/theos"
+          make clean
+          make package -j1
+          find packages -maxdepth 1 -type f -name '*.deb' -print
+          test -n "$(find packages -maxdepth 1 -type f -name '*.deb' -print -quit)"
+
+      - name: Make IPA
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod 755 scripts/package_ipa.sh
+          ./scripts/package_ipa.sh
+
+      - name: Upload IPA and deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: LiquidGlassLab-0.4.0
+          path: out/*
+          if-no-files-found: error
+          retention-days: 14
