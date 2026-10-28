@@ -85,12 +85,47 @@ private final class PhotosSystemTabController: UITabBarController {
         // Intentionally no bottomAccessory. UIKit alone owns the native
         // tab bar, its selected platter, scroll minimization, and Search tab.
 
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(settingsChanged(_:)),
+            name: LabSettings.didChange,
+            object: nil
+        )
+
         LabProbe.shared.register("底栏") { [weak self] in self?.tabBar }
         if LabProbe.isEnabled {
             // After the first frames, so the probe can never hold up launch.
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
                 LabProbe.shared.start()
             }
+        }
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        applyBarTransform()
+    }
+
+    @objc private func settingsChanged(_ notification: Notification) {
+        let key = notification.userInfo?[LabSettings.changedKey] as? String ?? ""
+        if key.isEmpty || key.hasPrefix("lab.bottom.") {
+            applyBarTransform()
+        }
+    }
+
+    /// The bar keeps the frame UIKit lays it out at; a transform on top of
+    /// that scales it about its bottom center and moves it. Touches follow
+    /// the transform, and the platter, lens, Search tab and minimizing stay
+    /// UIKit's own.
+    private func applyBarTransform() {
+        let scale = LabSettings.bottomScale
+        let height = tabBar.bounds.height
+        let transform = CGAffineTransform(
+            translationX: LabSettings.bottomOffsetX,
+            y: LabSettings.bottomOffsetY + height * (1 - scale) / 2
+        ).scaledBy(x: scale, y: scale)
+        if tabBar.transform != transform {
+            tabBar.transform = transform
         }
     }
 }
@@ -128,13 +163,16 @@ private enum LabKey {
     static let rightBottom = "lab.right.bottom"
     static let rightEdge = "lab.right.edge"
     static let bottomMinimize = "lab.bottom.minimize"
+    static let bottomScale = "lab.bottom.scale"
+    static let bottomOffsetX = "lab.bottom.offsetX"
+    static let bottomOffsetY = "lab.bottom.offsetY"
     static let appearance = "lab.appearance"
 
     static let all = [
         groupImpl, sideImpl, groupCount, keepSingle, groupScale, slotWidth,
         sideScale, sideMargin, nearGroup, edgeEffect, transparentBars,
         rightMaterial, rightScale, rightSpacing, rightMargin, rightBottom, rightEdge,
-        bottomMinimize, appearance,
+        bottomMinimize, bottomScale, bottomOffsetX, bottomOffsetY, appearance,
     ]
 }
 
@@ -212,6 +250,11 @@ private enum LabSettings {
     /// modes and default as the top chrome (`edgeEffect`).
     static var rightEdge: Int { labClamp(integer(LabKey.rightEdge, 1), 0, 4) }
     static var bottomMinimize: Bool { flag(LabKey.bottomMinimize, true) }
+    /// The whole tab bar scaled about its bottom center, then moved
+    /// (points; negative y is up).
+    static var bottomScale: CGFloat { CGFloat(labClamp(number(LabKey.bottomScale, 1.0), 0.5, 1.3)) }
+    static var bottomOffsetX: CGFloat { CGFloat(labClamp(number(LabKey.bottomOffsetX, 0), -150, 150)) }
+    static var bottomOffsetY: CGFloat { CGFloat(labClamp(number(LabKey.bottomOffsetY, 0), -400, 100)) }
     /// 0 follow system, 1 dark, 2 light.
     static var appearance: Int { labClamp(integer(LabKey.appearance, 1), 0, 2) }
 }
@@ -1674,6 +1717,8 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             applyRightEdge()
         case LabKey.bottomMinimize:
             applyBottomMinimize()
+        case LabKey.bottomScale, LabKey.bottomOffsetX, LabKey.bottomOffsetY:
+            break // the tab bar controller applies these
         case LabKey.appearance:
             applyAppearance()
         default:
@@ -1768,6 +1813,13 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         ]
         lines.append(topChrome.diagnostics())
         lines.append(actions.diagnostics())
+        if let bar = tabBarController?.tabBar {
+            lines.append(
+                "底栏 屏幕 \(labRect(bar.convert(bar.bounds, to: nil)))"
+                + " · 缩放 \(labFormat(LabSettings.bottomScale, digits: 2))"
+                + " · 位移 \(labFormat(LabSettings.bottomOffsetX)),\(labFormat(LabSettings.bottomOffsetY))"
+            )
+        }
         return lines.joined(separator: "\n")
     }
 
@@ -1988,6 +2040,21 @@ private final class LabSettingsViewController: UIViewController {
             "底栏随滑动缩小",
             value: LabSettings.bottomMinimize
         ) { LabSettings.store($0, LabKey.bottomMinimize) })
+        stack.addArrangedSubview(sliderRow(
+            "底栏整体缩放（以底边中心为基准）",
+            value: Double(LabSettings.bottomScale),
+            range: 0.5...1.3
+        ) { LabSettings.store($0, LabKey.bottomScale) })
+        stack.addArrangedSubview(sliderRow(
+            "底栏左右位移",
+            value: Double(LabSettings.bottomOffsetX),
+            range: -150...150
+        ) { LabSettings.store($0, LabKey.bottomOffsetX) })
+        stack.addArrangedSubview(sliderRow(
+            "底栏上下位移（负数向上）",
+            value: Double(LabSettings.bottomOffsetY),
+            range: -400...100
+        ) { LabSettings.store($0, LabKey.bottomOffsetY) })
         stack.addArrangedSubview(segmentRow(
             "深浅色",
             items: ["跟随系统", "深色", "浅色"],
