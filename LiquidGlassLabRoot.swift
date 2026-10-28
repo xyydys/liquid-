@@ -84,6 +84,11 @@ private final class PhotosSystemTabController: UITabBarController {
 
         // Intentionally no bottomAccessory. UIKit alone owns the native
         // tab bar, its selected platter, scroll minimization, and Search tab.
+
+        LabProbe.shared.register("底栏") { [weak self] in self?.tabBar }
+        if LabProbe.isEnabled {
+            LabProbe.shared.start()
+        }
     }
 }
 
@@ -1569,6 +1574,9 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         recoverFromCrashedRebuildIfNeeded()
         applyAll()
 
+        LabProbe.shared.register("顶部") { [weak self] in self?.topChrome }
+        LabProbe.shared.register("右侧") { [weak self] in self?.actions }
+
         // The right column's glass buttons keep the light/dark look they were
         // built with; the bars follow a later style change, these do not. So
         // rebuild them whenever the style changes (setting or system).
@@ -1762,6 +1770,7 @@ private final class LabSettingsViewController: UIViewController {
     private let scrollView = UIScrollView()
     private let stack = UIStackView()
     private let diagnosticsLabel = UILabel()
+    private let probeLabel = UILabel()
 
     override func viewDidLoad() {
         super.viewDidLoad()
@@ -1923,6 +1932,55 @@ private final class LabSettingsViewController: UIViewController {
             selected: LabSettings.appearance
         ) { LabSettings.store($0, LabKey.appearance) })
 
+        stack.addArrangedSubview(header("探针：抓系统玻璃设置的变化"))
+        stack.addArrangedSubview(caption(
+            "打开后一直记录（重启 App 也继续）。去系统设置里切换“液态玻璃 透明/色调”，再回来；"
+            + "或在上面切深浅色。然后点“复制探针日志”发回。日志存在 App 的 Documents/probe.log。"
+        ))
+        stack.addArrangedSubview(switchRow(
+            "探针",
+            value: LabProbe.shared.isRunning
+        ) { on in
+            UserDefaults.standard.set(on, forKey: LabProbe.enabledKey)
+            if on {
+                LabProbe.shared.start()
+            } else {
+                LabProbe.shared.stop()
+            }
+        })
+        probeLabel.numberOfLines = 0
+        probeLabel.font = .monospacedSystemFont(ofSize: 10, weight: .regular)
+        probeLabel.textColor = .secondaryLabel
+        stack.addArrangedSubview(probeLabel)
+        refreshProbe()
+        LabProbe.shared.onLog = { [weak self] in
+            self?.refreshProbe()
+        }
+        stack.addArrangedSubview(actionButton("复制探针日志") {
+            UIPasteboard.general.string = LabProbe.shared.logText
+        })
+        stack.addArrangedSubview(actionButton("全量抓取并复制（底栏/顶部/右侧对照）") {
+            UIPasteboard.general.string = LabProbe.shared.fullDump()
+            LabProbe.shared.log("全量抓取已复制")
+        })
+        stack.addArrangedSubview(actionButton("实验A：把底栏的玻璃 effect 复制给顶部和右侧") {
+            LabProbe.shared.copyTabBarEffect()
+        })
+        stack.addArrangedSubview(actionButton("实验B：窗口切到跟随系统再切回") {
+            LabProbe.shared.cycleWindowStyle()
+        })
+        stack.addArrangedSubview(actionButton("重建顶部和右侧") {
+            LabProbe.shared.log("重建顶部和右侧")
+            NotificationCenter.default.post(
+                name: LabSettings.didChange,
+                object: nil,
+                userInfo: [LabSettings.changedKey: ""]
+            )
+        })
+        stack.addArrangedSubview(actionButton("清空探针日志") {
+            LabProbe.shared.clear()
+        })
+
         var resetConfiguration = UIButton.Configuration.glass()
         resetConfiguration.title = "恢复默认"
         let reset = UIButton(configuration: resetConfiguration)
@@ -1943,6 +2001,21 @@ private final class LabSettingsViewController: UIViewController {
         右侧按钮全部按真实尺寸缩放。所有改动即时生效，可停在小/中半屏对照；上方测量信息可复制后发回。
         """
         stack.addArrangedSubview(note)
+    }
+
+    /// The last lines of the probe log, newest last.
+    private func refreshProbe() {
+        let tail = LabProbe.shared.lines.suffix(14)
+        probeLabel.text = (LabProbe.shared.isRunning ? "记录中" : "已停止")
+            + " · 共 \(LabProbe.shared.lines.count) 行\n" + tail.joined(separator: "\n")
+    }
+
+    private func actionButton(_ title: String, action: @escaping () -> Void) -> UIButton {
+        var configuration = UIButton.Configuration.glass()
+        configuration.title = title
+        let button = UIButton(configuration: configuration)
+        button.addAction(UIAction { _ in action() }, for: .primaryActionTriggered)
+        return button
     }
 
     private func header(_ text: String) -> UILabel {
@@ -2026,6 +2099,462 @@ private final class LabSettingsViewController: UIViewController {
         row.alignment = .center
         row.spacing = 12
         return row
+    }
+}
+
+// MARK: - Probe (what changes when the system glass setting changes)
+
+/// Records the moment the system Liquid Glass setting (Clear / Tinted)
+/// reaches the app. The tab bar always follows that setting, so the probe
+/// compares it with the top chrome and the right column: every notification
+/// the app receives, the trait collections, matching global defaults, the
+/// accessibility flags, and every glass view, effect and filtered layer
+/// (with the private ivars of effects and filters) under each region. Each
+/// change is written as a line diff with a time stamp to Documents/probe.log,
+/// which survives relaunches.
+@available(iOS 26.0, *)
+private final class LabProbe {
+    static let shared = LabProbe()
+    static let enabledKey = "lab.probe.enabled"
+
+    static var isEnabled: Bool {
+        UserDefaults.standard.object(forKey: enabledKey) == nil
+            ? true
+            : UserDefaults.standard.bool(forKey: enabledKey)
+    }
+
+    /// Called on the main queue after each new log line.
+    var onLog: (() -> Void)?
+    private(set) var lines: [String] = []
+
+    private var regions: [(name: String, view: () -> UIView?)] = []
+    private var snapshot: [String: [String]] = [:]
+    private var timer: Timer?
+    private var observer: NSObjectProtocol?
+    private var lastNotificationTimes: [String: TimeInterval] = [:]
+    private var checkPending = false
+    private let logURL = FileManager.default
+        .urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("probe.log")
+    private let clock: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "HH:mm:ss.SSS"
+        return formatter
+    }()
+
+    var isRunning: Bool { timer != nil }
+
+    func register(_ name: String, _ view: @escaping () -> UIView?) {
+        regions.removeAll { $0.name == name }
+        regions.append((name, view))
+        if isRunning {
+            check("登记 \(name)")
+        }
+    }
+
+    func start() {
+        guard timer == nil else { return }
+        if let size = try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? Int,
+           size > 4_000_000 {
+            try? FileManager.default.removeItem(at: logURL)
+        }
+        if lines.isEmpty, let saved = try? String(contentsOf: logURL, encoding: .utf8) {
+            lines = Array(saved.split(separator: "\n", omittingEmptySubsequences: false).suffix(3000).map(String.init))
+        }
+        log("====== 探针开始 · \(Date()) ======")
+        snapshot = capture()
+        log("基线：" + snapshot.keys.sorted().map { "\($0) \(snapshot[$0]?.count ?? 0) 行" }.joined(separator: " · "))
+        observer = NotificationCenter.default.addObserver(
+            forName: nil,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            self?.noted(notification)
+        }
+        timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.check("定时")
+        }
+    }
+
+    func stop() {
+        guard let timer else { return }
+        timer.invalidate()
+        self.timer = nil
+        if let observer {
+            NotificationCenter.default.removeObserver(observer)
+        }
+        observer = nil
+        log("====== 探针停止 ======")
+    }
+
+    func clear() {
+        lines = []
+        try? FileManager.default.removeItem(at: logURL)
+        log("（日志已清空）")
+        if isRunning {
+            snapshot = capture()
+        }
+    }
+
+    var logText: String { lines.joined(separator: "\n") }
+
+    /// Every captured line, for one full comparison of the regions.
+    func fullDump() -> String {
+        let now = capture()
+        var out = ["====== 全量抓取 · \(Date()) ======"]
+        for key in now.keys.sorted() {
+            out.append("[\(key)]")
+            out.append(contentsOf: now[key] ?? [])
+        }
+        return out.joined(separator: "\n")
+    }
+
+    func log(_ text: String) {
+        let line = "\(clock.string(from: Date())) \(text)"
+        lines.append(line)
+        if lines.count > 4000 {
+            lines.removeFirst(lines.count - 3000)
+        }
+        if let data = (line + "\n").data(using: .utf8) {
+            if let handle = try? FileHandle(forWritingTo: logURL) {
+                handle.seekToEndOfFile()
+                handle.write(data)
+                try? handle.close()
+            } else {
+                try? data.write(to: logURL)
+            }
+        }
+        onLog?()
+    }
+
+    // MARK: Watching
+
+    private func noted(_ notification: Notification) {
+        let name = notification.name.rawValue
+        let now = Date().timeIntervalSinceReferenceDate
+        if let last = lastNotificationTimes[name], now - last < 1 {
+            return
+        }
+        lastNotificationTimes[name] = now
+        let object = notification.object.map { String(describing: type(of: $0)) } ?? "nil"
+        let keys = notification.userInfo.map { info in
+            " userInfo=" + Self.clean(info.map { "\($0.key)=\($0.value)" }.joined(separator: ", "), limit: 300)
+        } ?? ""
+        log("通知 \(name) · \(object)\(keys)")
+        guard !checkPending else { return }
+        checkPending = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+            self?.checkPending = false
+            self?.check("通知 \(name)")
+        }
+    }
+
+    func check(_ reason: String) {
+        let now = capture()
+        var headed = false
+        for key in Set(now.keys).union(snapshot.keys).sorted() {
+            let old = snapshot[key] ?? []
+            let new = now[key] ?? []
+            guard old != new else { continue }
+            if !headed {
+                log("—— 变化（\(reason)）——")
+                headed = true
+            }
+            let oldSet = Set(old)
+            let newSet = Set(new)
+            let removed = old.filter { !newSet.contains($0) }
+            let added = new.filter { !oldSet.contains($0) }
+            log("[\(key)] 去掉 \(removed.count) 行，新增 \(added.count) 行")
+            for line in removed.prefix(60) {
+                log("  - " + line)
+            }
+            for line in added.prefix(60) {
+                log("  + " + line)
+            }
+        }
+        snapshot = now
+    }
+
+    // MARK: Capture
+
+    private func capture() -> [String: [String]] {
+        var result: [String: [String]] = [:]
+        result["全局默认值"] = Self.matchingDefaults()
+        if let domain = Bundle.main.bundleIdentifier,
+           let saved = UserDefaults.standard.persistentDomain(forName: domain) {
+            result["App 设置"] = saved.keys.sorted().map { "\($0) = \(Self.clean("\(saved[$0] ?? "nil")", limit: 120))" }
+        }
+        result["无障碍"] = [
+            "降低透明度=\(UIAccessibility.isReduceTransparencyEnabled)",
+            "增强对比度=\(UIAccessibility.isDarkerSystemColorsEnabled)",
+            "按钮形状=\(UIAccessibility.buttonShapesEnabled)",
+            "减弱动态效果=\(UIAccessibility.isReduceMotionEnabled)",
+            "反转颜色=\(UIAccessibility.isInvertColorsEnabled)",
+        ]
+        var window: UIWindow?
+        for region in regions {
+            guard let view = region.view() else {
+                result[region.name + "·玻璃"] = ["（视图不存在）"]
+                continue
+            }
+            window = window ?? view.window
+            result[region.name + "·特征"] = Self.traitLines(view.traitCollection)
+            result[region.name + "·玻璃"] = Self.glassLines(view)
+        }
+        if let window {
+            result["窗口·特征"] = Self.traitLines(window.traitCollection)
+                + ["override=\(window.overrideUserInterfaceStyle.rawValue)"]
+            if let scene = window.windowScene {
+                result["场景·特征"] = Self.traitLines(scene.traitCollection)
+            }
+        }
+        return result
+    }
+
+    private static let defaultsPattern = try? NSRegularExpression(
+        pattern: "glass|tint|transparen|solarium|material|liquid|contrast|reduce|interfacestyle|appearance|clear",
+        options: [.caseInsensitive]
+    )
+
+    private static func matchingDefaults() -> [String] {
+        let dictionary = UserDefaults.standard.dictionaryRepresentation()
+        return dictionary.keys.sorted().compactMap { key in
+            let range = NSRange(key.startIndex..., in: key)
+            guard defaultsPattern?.firstMatch(in: key, range: range) != nil,
+                  !key.hasPrefix("lab.")
+            else {
+                return nil
+            }
+            return "\(key) = \(clean("\(dictionary[key] ?? "nil")", limit: 200))"
+        }
+    }
+
+    private static func traitLines(_ traits: UITraitCollection) -> [String] {
+        let text = clean(traits.description, limit: 20_000)
+        return text
+            .components(separatedBy: CharacterSet(charactersIn: ";,"))
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty && !$0.hasPrefix("<UITraitCollection") }
+    }
+
+    private static let classPattern = try? NSRegularExpression(
+        pattern: "glass|backdrop|portal|material|lens|platter|effect|blur|vibran|sdf|tint",
+        options: [.caseInsensitive]
+    )
+
+    private static func matches(_ name: String) -> Bool {
+        classPattern?.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)) != nil
+    }
+
+    /// Glass views, their effects, and every filtered or glass-like layer
+    /// under `root`, keyed by their path of child indexes.
+    private static func glassLines(_ root: UIView) -> [String] {
+        var out: [String] = []
+        var count = 0
+
+        /// Layers that belong to this view and are not other views' layers.
+        func walkLayer(_ layer: CALayer, _ path: String, owner: UIView) {
+            count += 1
+            guard count < 4000 else { return }
+            let name = NSStringFromClass(type(of: layer))
+            let filters = (layer.filters ?? []) + (layer.backgroundFilters ?? [])
+            if !filters.isEmpty || layer.compositingFilter != nil || matches(name) {
+                var line = "层 \(path) \(name) 透明度=\(labFormat(CGFloat(layer.opacity), digits: 2))"
+                    + " 底色=\(color(layer.backgroundColor)) 隐藏=\(layer.isHidden)"
+                if let compositing = layer.compositingFilter {
+                    line += " 合成=\(clean(String(describing: compositing), limit: 120))"
+                }
+                if name.lowercased().contains("backdrop") {
+                    for key in ["scale", "groupName", "zoom", "marginWidth", "captureOnly", "tracksLuma", "allowsInPlaceFiltering"] {
+                        if let value = layer.value(forKey: key) {
+                            line += " \(key)=\(clean(String(describing: value), limit: 60))"
+                        }
+                    }
+                }
+                out.append(line)
+                for (index, filter) in filters.enumerated() {
+                    guard let object = filter as? NSObject else { continue }
+                    out.append("  滤镜 \(path)#\(index) \(clean(object.description, limit: 200))")
+                    for ivar in ivars(object, classes: { _ in true }) {
+                        out.append("    \(path)#\(index) \(ivar)")
+                    }
+                }
+            }
+            for (index, sublayer) in (layer.sublayers ?? []).enumerated() {
+                if let view = sublayer.delegate as? UIView, view !== owner {
+                    continue
+                }
+                walkLayer(sublayer, "\(path).\(index)", owner: owner)
+            }
+        }
+
+        func walkView(_ view: UIView, _ path: String) {
+            count += 1
+            guard count < 1500 else { return }
+            let name = NSStringFromClass(type(of: view))
+            if view is UIVisualEffectView || matches(name) {
+                var line = "视图 \(path) \(name) 透明度=\(labFormat(view.alpha, digits: 2))"
+                    + " 隐藏=\(view.isHidden) 风格=\(view.traitCollection.userInterfaceStyle.rawValue)"
+                    + " override=\(view.overrideUserInterfaceStyle.rawValue)"
+                if let effectView = view as? UIVisualEffectView {
+                    line += " effect=\(effectView.effect.map { clean(String(describing: $0), limit: 300) } ?? "nil")"
+                }
+                out.append(line)
+                for ivar in ivars(view, classes: { matches($0) }) {
+                    out.append("  ivar \(path) \(ivar)")
+                }
+                if let effect = (view as? UIVisualEffectView)?.effect {
+                    for ivar in ivars(effect, classes: { _ in true }) {
+                        out.append("  effect \(path) \(ivar)")
+                    }
+                }
+            }
+            walkLayer(view.layer, path + "L", owner: view)
+            for (index, subview) in view.subviews.enumerated() {
+                walkView(subview, "\(path).\(index)")
+            }
+        }
+
+        walkView(root, "0")
+        return out
+    }
+
+    private static func color(_ color: CGColor?) -> String {
+        guard let color, let components = color.components else { return "nil" }
+        return "(" + components.map { labFormat($0, digits: 3) }.joined(separator: ",") + ")"
+    }
+
+    /// Back pointers are skipped: they may be unretained.
+    private static let skippedIvars = ["delegate", "owner", "parent", "host", "window", "super", "target", "container", "observer", "weak"]
+
+    /// The ivars of `object`, for the classes in its hierarchy `classes`
+    /// accepts (object ivars as descriptions, plain numbers as values).
+    private static func ivars(_ object: AnyObject, classes: (String) -> Bool) -> [String] {
+        var out: [String] = []
+        var current: AnyClass? = object_getClass(object)
+        let base = UnsafeRawPointer(Unmanaged.passUnretained(object).toOpaque())
+        while let cls = current, cls != NSObject.self, cls != UIView.self, cls != UIResponder.self {
+            let className = NSStringFromClass(cls)
+            defer { current = class_getSuperclass(cls) }
+            guard classes(className) else { continue }
+            var count: UInt32 = 0
+            guard let list = class_copyIvarList(cls, &count) else { continue }
+            defer { free(list) }
+            for index in 0..<Int(count) {
+                let ivar = list[index]
+                guard let rawName = ivar_getName(ivar), let rawType = ivar_getTypeEncoding(ivar) else { continue }
+                let name = String(cString: rawName)
+                let lower = name.lowercased()
+                if skippedIvars.contains(where: { lower.contains($0) }) { continue }
+                let encoding = String(cString: rawType)
+                let pointer = base + ivar_getOffset(ivar)
+                let value: String
+                switch encoding.first {
+                case "@":
+                    if let item = object_getIvar(object, ivar) {
+                        if item is UIView || item is CALayer {
+                            value = "<\(String(describing: type(of: item)))>"
+                        } else {
+                            value = clean(String(describing: item), limit: 300)
+                        }
+                    } else {
+                        value = "nil"
+                    }
+                case "B": value = "\(pointer.loadUnaligned(as: Bool.self))"
+                case "c", "C": value = "\(pointer.loadUnaligned(as: Int8.self))"
+                case "s", "S": value = "\(pointer.loadUnaligned(as: Int16.self))"
+                case "i", "I": value = "\(pointer.loadUnaligned(as: Int32.self))"
+                case "q", "Q", "l", "L": value = "\(pointer.loadUnaligned(as: Int64.self))"
+                case "f": value = "\(pointer.loadUnaligned(as: Float.self))"
+                case "d": value = "\(pointer.loadUnaligned(as: Double.self))"
+                default: continue
+                }
+                out.append("\(className).\(name)=\(value)")
+            }
+        }
+        return out
+    }
+
+    private static let addressPattern = try? NSRegularExpression(pattern: "0x[0-9a-fA-F]+")
+
+    /// One line, without memory addresses (they change on every rebuild).
+    static func clean(_ text: String, limit: Int) -> String {
+        var result = text.replacingOccurrences(of: "\n", with: " ")
+        if let addressPattern {
+            result = addressPattern.stringByReplacingMatches(
+                in: result,
+                range: NSRange(result.startIndex..., in: result),
+                withTemplate: "0x"
+            )
+        }
+        while result.contains("  ") {
+            result = result.replacingOccurrences(of: "  ", with: " ")
+        }
+        return result.count > limit ? String(result.prefix(limit)) + "…" : result
+    }
+
+    // MARK: Experiments
+
+    /// Experiment A: give every glass effect view in the top chrome and the
+    /// right column a copy of the tab bar's own glass effect.
+    func copyTabBarEffect() {
+        guard let tabRoot = regions.first(where: { $0.name == "底栏" })?.view() else {
+            log("实验A：找不到底栏")
+            return
+        }
+        let tabViews = Self.effectViews(in: tabRoot)
+        log("实验A：底栏里的玻璃视图 \(tabViews.count) 个：" + tabViews.map {
+            "\(NSStringFromClass(type(of: $0)))/\($0.effect.map { NSStringFromClass(type(of: $0)) } ?? "nil")"
+        }.joined(separator: "，"))
+        guard let source = tabViews.compactMap(\.effect).first(where: { Self.matches(NSStringFromClass(type(of: $0))) }) else {
+            log("实验A：底栏没有可复制的玻璃 effect")
+            return
+        }
+        var changed = 0
+        for region in regions where region.name != "底栏" {
+            guard let root = region.view() else { continue }
+            for view in Self.effectViews(in: root) where view.effect != nil {
+                view.effect = (source.copy() as? UIVisualEffect) ?? source
+                changed += 1
+            }
+        }
+        log("实验A：已把 \(NSStringFromClass(type(of: source))) 复制给 \(changed) 个玻璃视图")
+        check("实验A")
+    }
+
+    private static func effectViews(in root: UIView) -> [UIVisualEffectView] {
+        var result: [UIVisualEffectView] = []
+        var queue = [root]
+        var index = 0
+        while index < queue.count && index < 1500 {
+            let view = queue[index]
+            index += 1
+            if let effectView = view as? UIVisualEffectView {
+                result.append(effectView)
+            }
+            queue.append(contentsOf: view.subviews)
+        }
+        return result
+    }
+
+    /// Experiment B: what "跟随系统 → 深色" did by hand — the window style
+    /// goes to unspecified, then back.
+    func cycleWindowStyle() {
+        guard let window = regions.compactMap({ $0.view()?.window }).first else {
+            log("实验B：找不到窗口")
+            return
+        }
+        let original = window.overrideUserInterfaceStyle
+        log("实验B：窗口风格 \(original.rawValue) → 0（跟随系统）")
+        window.overrideUserInterfaceStyle = .unspecified
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
+            self?.check("实验B 跟随系统后")
+            window.overrideUserInterfaceStyle = original
+            self?.log("实验B：窗口风格 0 → \(original.rawValue)")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                self?.check("实验B 切回后")
+            }
+        }
     }
 }
 
