@@ -12,7 +12,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-26
+    runs-on: xcode-27
     timeout-minutes: 30
 
     steps:
@@ -27,7 +27,7 @@ jobs:
           SDK_VERSION="$(xcrun --sdk iphoneos --show-sdk-version)"
           echo "iPhoneOS SDK: $SDK_VERSION"
           MAJOR="${SDK_VERSION%%.*}"
-          [ "$MAJOR" -ge 26 ]
+          [ "$MAJOR" -ge 27 ]
 
       - name: Typecheck Swift against the iPhone SDK
         shell: bash
