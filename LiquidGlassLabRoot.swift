@@ -118,6 +118,7 @@ private enum LabKey {
     static let rightSpacing = "lab.right.spacing"
     static let rightMargin = "lab.right.margin"
     static let rightBottom = "lab.right.bottom"
+    static let rightStyle = "lab.right.style"
     static let bottomMinimize = "lab.bottom.minimize"
     static let appearance = "lab.appearance"
 
@@ -125,7 +126,7 @@ private enum LabKey {
         groupImpl, sideImpl, groupCount, keepSingle, groupScale, slotWidth,
         sideScale, sideMargin, nearGroup, edgeEffect, transparentBars,
         rightMaterial, rightScale, rightSpacing, rightMargin, rightBottom,
-        bottomMinimize, appearance,
+        rightStyle, bottomMinimize, appearance,
     ]
 }
 
@@ -194,6 +195,9 @@ private enum LabSettings {
     static var rightSpacing: CGFloat { CGFloat(labClamp(number(LabKey.rightSpacing, 14), 0, 30)) }
     static var rightMargin: CGFloat { CGFloat(labClamp(number(LabKey.rightMargin, 10), 0, 40)) }
     static var rightBottom: CGFloat { CGFloat(labClamp(number(LabKey.rightBottom, 24), 0, 200)) }
+    /// 0 follow the page behind the column (light glass on a bright page,
+    /// as the bars do), 1 follow the window's light/dark style.
+    static var rightStyle: Int { labClamp(integer(LabKey.rightStyle, 0), 0, 1) }
     static var bottomMinimize: Bool { flag(LabKey.bottomMinimize, true) }
     /// 0 follow system, 1 dark, 2 light.
     static var appearance: Int { labClamp(integer(LabKey.appearance, 1), 0, 2) }
@@ -1185,6 +1189,13 @@ private final class ActionColumnView: UIView {
         badge.backgroundColor = .white
         badge.clipsToBounds = true
         badge.isUserInteractionEnabled = false
+
+        // Glass buttons keep the light/dark look they were built with, so
+        // rebuild them whenever this column's style changes (window style or
+        // the column's own override from the page behind it).
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: ActionColumnView, _: UITraitCollection) in
+            view.rebuild()
+        }
     }
 
     required init?(coder: NSCoder) {
@@ -1343,6 +1354,23 @@ private final class FeedCell: UICollectionViewCell {
         ("纯黑", [UIColor.black, UIColor(white: 0.18, alpha: 1)], "film.fill"),
     ]
 
+    /// Relative luminance (0 black … 1 white) of a page's gradient at a point
+    /// given as fractions of the page (the gradient runs top-left to
+    /// bottom-right).
+    static func luminance(page: Int, x: CGFloat, y: CGFloat) -> CGFloat {
+        let colors = pages[page % pages.count].colors
+        let t = labClamp((x + y) / 2, 0, 1)
+        var a: (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        var b: (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
+        colors[0].getRed(&a.0, green: &a.1, blue: &a.2, alpha: &a.3)
+        colors[1].getRed(&b.0, green: &b.1, blue: &b.2, alpha: &b.3)
+        func linear(_ c: CGFloat, _ d: CGFloat) -> CGFloat {
+            let v = labClamp(c + (d - c) * t, 0, 1)
+            return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
+        }
+        return 0.2126 * linear(a.0, b.0) + 0.7152 * linear(a.1, b.1) + 0.0722 * linear(a.2, b.2)
+    }
+
     private let gradientLayer = CAGradientLayer()
     private let symbolView = UIImageView()
     private let authorLabel = UILabel()
@@ -1405,7 +1433,7 @@ private final class FeedCell: UICollectionViewCell {
 // MARK: - Douyin-like home
 
 @available(iOS 26.0, *)
-private final class DouyinHomeViewController: UIViewController, UICollectionViewDataSource {
+private final class DouyinHomeViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegate {
     private var feed: UICollectionView!
     private let topChrome = TopChromeView()
     private let actions = ActionColumnView()
@@ -1430,6 +1458,7 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         feed.showsVerticalScrollIndicator = false
         feed.contentInsetAdjustmentBehavior = .never
         feed.dataSource = self
+        feed.delegate = self
         feed.register(FeedCell.self, forCellWithReuseIdentifier: FeedCell.reuseIdentifier)
         view.addSubview(feed)
         // The native bottom bar reads this scroll view (minimize on scroll).
@@ -1463,14 +1492,6 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         )
         recoverFromCrashedRebuildIfNeeded()
         applyAll()
-
-        // The right column's glass buttons keep the light/dark look they were
-        // built with; the bars follow a later style change, these do not. So
-        // rebuild them whenever the style changes (setting or system).
-        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _: UITraitCollection) in
-            self.actions.rebuild()
-            self.view.setNeedsLayout()
-        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -1502,6 +1523,36 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             width: size.width,
             height: size.height
         )
+        applyRightStyle()
+    }
+
+    func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        applyRightStyle()
+    }
+
+    /// The bars pick light or dark glass from the content behind them; the
+    /// glass buttons only follow their trait style. "Follow the page" sets
+    /// the column's style from the page under the column's center, so it
+    /// flips like the bars: light on a bright page, dark on a dark one.
+    private func applyRightStyle() {
+        guard LabSettings.rightStyle == 0 else {
+            actions.overrideUserInterfaceStyle = .unspecified
+            return
+        }
+        let size = feed.bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+        let center = CGPoint(x: actions.frame.midX, y: actions.frame.midY)
+        let contentY = feed.contentOffset.y + center.y
+        let page = max(0, Int(floor(contentY / size.height)))
+        let luminance = FeedCell.luminance(
+            page: page,
+            x: center.x / size.width,
+            y: (contentY - CGFloat(page) * size.height) / size.height
+        )
+        let style: UIUserInterfaceStyle = luminance > 0.18 ? .light : .dark
+        if actions.overrideUserInterfaceStyle != style {
+            actions.overrideUserInterfaceStyle = style
+        }
     }
 
     // MARK: Settings
@@ -1521,6 +1572,8 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             view.setNeedsLayout()
         case LabKey.edgeEffect:
             applyEdgeEffect()
+        case LabKey.rightStyle:
+            applyRightStyle()
         case LabKey.bottomMinimize:
             applyBottomMinimize()
         case LabKey.appearance:
@@ -1786,6 +1839,11 @@ private final class LabSettingsViewController: UIViewController {
             items: ["按钮R", "按钮C", "视图R", "视图C"],
             selected: LabSettings.rightMaterial
         ) { LabSettings.store($0, LabKey.rightMaterial) })
+        stack.addArrangedSubview(segmentRow(
+            "深浅",
+            items: ["跟随背景", "跟随窗口"],
+            selected: LabSettings.rightStyle
+        ) { LabSettings.store($0, LabKey.rightStyle) })
         stack.addArrangedSubview(sliderRow(
             "整体缩放（真实尺寸）",
             value: Double(LabSettings.rightScale),
