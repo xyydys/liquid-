@@ -113,10 +113,12 @@ private final class PhotosSystemTabController: UITabBarController {
         }
     }
 
-    /// The bar keeps the frame UIKit lays it out at; a transform on top of
-    /// that scales it about its bottom center and moves it. Touches follow
-    /// the transform, and the platter, lens, Search tab and minimizing stay
-    /// UIKit's own.
+    /// Scales the bar about its bottom center and moves it. A transform on
+    /// the bar itself fights UIKit, which keeps laying the bar out by its
+    /// frame (the glass and lens came back full size while the icons
+    /// shrank). The bar's sublayer transform is left alone by UIKit and
+    /// moves everything drawn inside the bar; touches are mapped back by
+    /// LabTabBarScaling.
     private func applyBarTransform() {
         let scale = LabSettings.bottomScale
         let height = tabBar.bounds.height
@@ -124,9 +126,83 @@ private final class PhotosSystemTabController: UITabBarController {
             translationX: LabSettings.bottomOffsetX,
             y: LabSettings.bottomOffsetY + height * (1 - scale) / 2
         ).scaledBy(x: scale, y: scale)
-        if tabBar.transform != transform {
-            tabBar.transform = transform
+        LabTabBarScaling.install()
+        LabTabBarScaling.bar = tabBar
+        LabTabBarScaling.transform = transform
+        let layerTransform = CATransform3DMakeAffineTransform(transform)
+        if !CATransform3DEqualToTransform(tabBar.layer.sublayerTransform, layerTransform) {
+            tabBar.layer.sublayerTransform = layerTransform
         }
+    }
+}
+
+// MARK: - Tab bar scaling (touch mapping for the sublayer transform)
+
+/// Hit testing ignores a layer's sublayer transform, so the scaled and
+/// moved tab bar would take touches where it used to be. UITabBar's
+/// hitTest is swizzled once; for the app's main tab bar it maps the touch
+/// back through the inverse transform (about the bar's center, as Core
+/// Animation applies it) before UIKit's own hit test runs. Other tab bars
+/// are untouched.
+private enum LabTabBarScaling {
+    static weak var bar: UITabBar?
+    static var transform: CGAffineTransform = .identity
+    private static var installed = false
+
+    static func install() {
+        guard !installed else { return }
+        installed = true
+        let originalSelector = #selector(UIView.hitTest(_:with:))
+        let replacementSelector = #selector(UITabBar.lab_hitTest(_:with:))
+        guard let original = class_getInstanceMethod(UITabBar.self, originalSelector),
+              let replacement = class_getInstanceMethod(UITabBar.self, replacementSelector)
+        else {
+            return
+        }
+        // Add the method to UITabBar first, so UIView's own is never swapped.
+        if class_addMethod(
+            UITabBar.self,
+            originalSelector,
+            method_getImplementation(replacement),
+            method_getTypeEncoding(replacement)
+        ) {
+            class_replaceMethod(
+                UITabBar.self,
+                replacementSelector,
+                method_getImplementation(original),
+                method_getTypeEncoding(original)
+            )
+        } else {
+            method_exchangeImplementations(original, replacement)
+        }
+    }
+
+    /// Where a point drawn at `point` sits in the bar's own layout.
+    static func layoutPoint(_ point: CGPoint, in view: UIView) -> CGPoint {
+        let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        let local = CGPoint(x: point.x - center.x, y: point.y - center.y)
+            .applying(transform.inverted())
+        return CGPoint(x: local.x + center.x, y: local.y + center.y)
+    }
+
+    /// The bar's bounds as drawn, in window coordinates.
+    static func drawnFrame(of view: UIView) -> CGRect {
+        let center = CGPoint(x: view.bounds.midX, y: view.bounds.midY)
+        let drawn = view.bounds
+            .offsetBy(dx: -center.x, dy: -center.y)
+            .applying(transform)
+            .offsetBy(dx: center.x, dy: center.y)
+        return view.convert(drawn, to: nil)
+    }
+}
+
+extension UITabBar {
+    /// Swapped with hitTest(_:with:); calling it runs UIKit's original.
+    @objc fileprivate func lab_hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        guard self === LabTabBarScaling.bar, !LabTabBarScaling.transform.isIdentity else {
+            return lab_hitTest(point, with: event)
+        }
+        return lab_hitTest(LabTabBarScaling.layoutPoint(point, in: self), with: event)
     }
 }
 
@@ -1815,7 +1891,7 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         lines.append(actions.diagnostics())
         if let bar = tabBarController?.tabBar {
             lines.append(
-                "底栏 屏幕 \(labRect(bar.convert(bar.bounds, to: nil)))"
+                "底栏 屏幕 \(labRect(LabTabBarScaling.drawnFrame(of: bar)))"
                 + " · 缩放 \(labFormat(LabSettings.bottomScale, digits: 2))"
                 + " · 位移 \(labFormat(LabSettings.bottomOffsetX)),\(labFormat(LabSettings.bottomOffsetY))"
             )
