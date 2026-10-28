@@ -118,7 +118,6 @@ private enum LabKey {
     static let rightSpacing = "lab.right.spacing"
     static let rightMargin = "lab.right.margin"
     static let rightBottom = "lab.right.bottom"
-    static let rightStyle = "lab.right.style"
     static let bottomMinimize = "lab.bottom.minimize"
     static let appearance = "lab.appearance"
 
@@ -126,7 +125,7 @@ private enum LabKey {
         groupImpl, sideImpl, groupCount, keepSingle, groupScale, slotWidth,
         sideScale, sideMargin, nearGroup, edgeEffect, transparentBars,
         rightMaterial, rightScale, rightSpacing, rightMargin, rightBottom,
-        rightStyle, bottomMinimize, appearance,
+        bottomMinimize, appearance,
     ]
 }
 
@@ -189,15 +188,13 @@ private enum LabSettings {
     static var edgeEffect: Int { labClamp(integer(LabKey.edgeEffect, 0), 0, 3) }
     static var transparentBars: Bool { flag(LabKey.transparentBars, false) }
     /// 0 glass button Regular, 1 glass button Clear, 2 glass view Regular,
-    /// 3 glass view Clear.
-    static var rightMaterial: Int { labClamp(integer(LabKey.rightMaterial, 0), 0, 3) }
+    /// 3 glass view Clear, 4 navigation bar item (bar glass, follows the
+    /// system Liquid Glass setting like the top side buttons).
+    static var rightMaterial: Int { labClamp(integer(LabKey.rightMaterial, 4), 0, 4) }
     static var rightScale: CGFloat { CGFloat(labClamp(number(LabKey.rightScale, 1.0), 0.6, 1.3)) }
     static var rightSpacing: CGFloat { CGFloat(labClamp(number(LabKey.rightSpacing, 14), 0, 30)) }
     static var rightMargin: CGFloat { CGFloat(labClamp(number(LabKey.rightMargin, 10), 0, 40)) }
     static var rightBottom: CGFloat { CGFloat(labClamp(number(LabKey.rightBottom, 24), 0, 200)) }
-    /// 0 follow the page behind the column (light glass on a bright page,
-    /// as the bars do), 1 follow the window's light/dark style.
-    static var rightStyle: Int { labClamp(integer(LabKey.rightStyle, 0), 0, 1) }
     static var bottomMinimize: Bool { flag(LabKey.bottomMinimize, true) }
     /// 0 follow system, 1 dark, 2 light.
     static var appearance: Int { labClamp(integer(LabKey.appearance, 1), 0, 2) }
@@ -353,11 +350,17 @@ private enum LabGlass {
     }
 }
 
+/// A round control in the right column, whichever glass draws it.
+@available(iOS 26.0, *)
+private protocol LabCircle: UIView {
+    func setTint(_ color: UIColor)
+}
+
 /// A circular glass control at its real size. Kinds: UIKit's glass button
 /// configurations (Regular / Clear), or an interactive UIGlassEffect view
 /// (Regular / Clear) holding a plain button.
 @available(iOS 26.0, *)
-private final class GlassCircle: UIView {
+private final class GlassCircle: UIView, LabCircle {
     enum Kind: Int {
         case buttonRegular = 0
         case buttonClear = 1
@@ -431,6 +434,94 @@ private final class GlassCircle: UIView {
         guard var configuration = button.configuration else { return }
         configuration.baseForegroundColor = color
         button.configuration = configuration
+    }
+}
+
+/// A navigation bar that only takes touches on its items.
+@available(iOS 26.0, *)
+private final class ItemOnlyNavigationBar: UINavigationBar {
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        let hit = super.hitTest(point, with: event)
+        return hit === self ? nil : hit
+    }
+}
+
+/// A round control drawn by a one-item navigation bar, so its glass is bar
+/// glass: the material of the top side buttons and the tab bar, which
+/// follows the system Liquid Glass setting (Clear / Tinted). The glass
+/// buttons and glass views do not. UIKit keeps the item at its own size;
+/// the bar is scaled so the item matches the wanted diameter.
+@available(iOS 26.0, *)
+private final class BarGlassCircle: UIView, LabCircle {
+    private let bar = ItemOnlyNavigationBar()
+    private let item: UIBarButtonItem
+    private let symbol: String
+    private let pointSize: CGFloat
+    private var tint: UIColor
+    private var imageKey: (scale: CGFloat, tint: UIColor)?
+
+    init(symbol: String, pointSize: CGFloat, tint: UIColor = .label, action: (() -> Void)? = nil) {
+        self.symbol = symbol
+        self.pointSize = pointSize
+        self.tint = tint
+        item = UIBarButtonItem(
+            image: nil,
+            primaryAction: action.map { action in UIAction { _ in action() } }
+        )
+        super.init(frame: .zero)
+        backgroundColor = .clear
+        bar.tintColor = .label
+        bar.directionalLayoutMargins = .zero
+        let navigationItem = UINavigationItem(title: "")
+        navigationItem.leftBarButtonItem = item
+        bar.setItems([navigationItem], animated: false)
+        addSubview(bar)
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    func setTint(_ color: UIColor) {
+        tint = color
+        setNeedsLayout()
+    }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        guard bounds.width > 0 else { return }
+        // Lay the bar out unscaled, measure UIKit's item, then scale and
+        // place the bar so that item is centered here at this view's size.
+        bar.transform = .identity
+        let height = max(44, bar.sizeThatFits(CGSize(width: 120, height: 200)).height)
+        bar.bounds = CGRect(x: 0, y: 0, width: 120, height: height)
+        bar.center = CGPoint(x: bounds.midX, y: bounds.midY)
+        updateImage(scale: bounds.width / 44)
+        bar.layoutIfNeeded()
+        guard let control = LabGlass.controls(in: bar).first, control.bounds.width > 0 else {
+            return
+        }
+        let scale = bounds.width / control.bounds.width
+        let frame = control.convert(control.bounds, to: bar)
+        let offset = CGPoint(x: frame.midX - bar.bounds.midX, y: frame.midY - bar.bounds.midY)
+        bar.transform = CGAffineTransform(scaleX: scale, y: scale)
+        bar.center = CGPoint(x: bounds.midX - offset.x * scale, y: bounds.midY - offset.y * scale)
+    }
+
+    /// The symbol is drawn at pointSize / scale, so after the bar's scale it
+    /// shows at the column's own point size.
+    private func updateImage(scale: CGFloat) {
+        if let imageKey, abs(imageKey.scale - scale) < 0.001, imageKey.tint == tint {
+            return
+        }
+        imageKey = (scale, tint)
+        let configuration = UIImage.SymbolConfiguration(pointSize: pointSize / scale, weight: .semibold)
+        var image = UIImage(systemName: symbol, withConfiguration: configuration)
+        // A tinted bar item gets tinted glass, so the color goes in the image.
+        if tint != .label {
+            image = image?.withTintColor(tint, renderingMode: .alwaysOriginal)
+        }
+        item.image = image
     }
 }
 
@@ -1174,7 +1265,7 @@ private final class ActionColumnView: UIView {
         let pointSize: CGFloat
     }
 
-    private var circles: [GlassCircle] = []
+    private var circles: [any LabCircle] = []
     private var labels: [UILabel?] = []
     private var diameters: [CGFloat] = []
     private let badge = UIImageView()
@@ -1189,13 +1280,6 @@ private final class ActionColumnView: UIView {
         badge.backgroundColor = .white
         badge.clipsToBounds = true
         badge.isUserInteractionEnabled = false
-
-        // Glass buttons keep the light/dark look they were built with, so
-        // rebuild them whenever this column's style changes (window style or
-        // the column's own override from the page behind it).
-        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (view: ActionColumnView, _: UITraitCollection) in
-            view.rebuild()
-        }
     }
 
     required init?(coder: NSCoder) {
@@ -1217,7 +1301,7 @@ private final class ActionColumnView: UIView {
         labels = []
         diameters = []
 
-        let kind = GlassCircle.Kind(rawValue: LabSettings.rightMaterial) ?? .buttonRegular
+        let kind = GlassCircle.Kind(rawValue: LabSettings.rightMaterial)
         let scale = LabSettings.rightScale
         let specs = [
             Spec(symbol: "person.crop.circle.fill", count: nil, diameter: 52, pointSize: 30),
@@ -1230,16 +1314,26 @@ private final class ActionColumnView: UIView {
 
         for (index, spec) in specs.enumerated() {
             let tint: UIColor = (index == 1 && liked) ? .systemRed : .label
-            let circle = GlassCircle(
-                kind: kind,
-                symbol: spec.symbol,
-                pointSize: spec.pointSize * scale,
-                tint: tint
-            )
-            if index == 1 {
-                circle.button.addAction(UIAction { [weak self] _ in
-                    self?.toggleLike()
-                }, for: .primaryActionTriggered)
+            let action: (() -> Void)? = index == 1 ? { [weak self] in self?.toggleLike() } : nil
+            let circle: any LabCircle
+            if let kind {
+                let glass = GlassCircle(
+                    kind: kind,
+                    symbol: spec.symbol,
+                    pointSize: spec.pointSize * scale,
+                    tint: tint
+                )
+                if let action {
+                    glass.button.addAction(UIAction { _ in action() }, for: .primaryActionTriggered)
+                }
+                circle = glass
+            } else {
+                circle = BarGlassCircle(
+                    symbol: spec.symbol,
+                    pointSize: spec.pointSize * scale,
+                    tint: tint,
+                    action: action
+                )
             }
             addSubview(circle)
             circles.append(circle)
@@ -1354,23 +1448,6 @@ private final class FeedCell: UICollectionViewCell {
         ("纯黑", [UIColor.black, UIColor(white: 0.18, alpha: 1)], "film.fill"),
     ]
 
-    /// Relative luminance (0 black … 1 white) of a page's gradient at a point
-    /// given as fractions of the page (the gradient runs top-left to
-    /// bottom-right).
-    static func luminance(page: Int, x: CGFloat, y: CGFloat) -> CGFloat {
-        let colors = pages[page % pages.count].colors
-        let t = labClamp((x + y) / 2, 0, 1)
-        var a: (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
-        var b: (CGFloat, CGFloat, CGFloat, CGFloat) = (0, 0, 0, 0)
-        colors[0].getRed(&a.0, green: &a.1, blue: &a.2, alpha: &a.3)
-        colors[1].getRed(&b.0, green: &b.1, blue: &b.2, alpha: &b.3)
-        func linear(_ c: CGFloat, _ d: CGFloat) -> CGFloat {
-            let v = labClamp(c + (d - c) * t, 0, 1)
-            return v <= 0.04045 ? v / 12.92 : pow((v + 0.055) / 1.055, 2.4)
-        }
-        return 0.2126 * linear(a.0, b.0) + 0.7152 * linear(a.1, b.1) + 0.0722 * linear(a.2, b.2)
-    }
-
     private let gradientLayer = CAGradientLayer()
     private let symbolView = UIImageView()
     private let authorLabel = UILabel()
@@ -1433,7 +1510,7 @@ private final class FeedCell: UICollectionViewCell {
 // MARK: - Douyin-like home
 
 @available(iOS 26.0, *)
-private final class DouyinHomeViewController: UIViewController, UICollectionViewDataSource, UICollectionViewDelegate {
+private final class DouyinHomeViewController: UIViewController, UICollectionViewDataSource {
     private var feed: UICollectionView!
     private let topChrome = TopChromeView()
     private let actions = ActionColumnView()
@@ -1458,7 +1535,6 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         feed.showsVerticalScrollIndicator = false
         feed.contentInsetAdjustmentBehavior = .never
         feed.dataSource = self
-        feed.delegate = self
         feed.register(FeedCell.self, forCellWithReuseIdentifier: FeedCell.reuseIdentifier)
         view.addSubview(feed)
         // The native bottom bar reads this scroll view (minimize on scroll).
@@ -1492,6 +1568,14 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
         )
         recoverFromCrashedRebuildIfNeeded()
         applyAll()
+
+        // The right column's glass buttons keep the light/dark look they were
+        // built with; the bars follow a later style change, these do not. So
+        // rebuild them whenever the style changes (setting or system).
+        registerForTraitChanges([UITraitUserInterfaceStyle.self]) { (self: Self, _: UITraitCollection) in
+            self.actions.rebuild()
+            self.view.setNeedsLayout()
+        }
     }
 
     override func viewWillAppear(_ animated: Bool) {
@@ -1523,36 +1607,6 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             width: size.width,
             height: size.height
         )
-        applyRightStyle()
-    }
-
-    func scrollViewDidScroll(_ scrollView: UIScrollView) {
-        applyRightStyle()
-    }
-
-    /// The bars pick light or dark glass from the content behind them; the
-    /// glass buttons only follow their trait style. "Follow the page" sets
-    /// the column's style from the page under the column's center, so it
-    /// flips like the bars: light on a bright page, dark on a dark one.
-    private func applyRightStyle() {
-        guard LabSettings.rightStyle == 0 else {
-            actions.overrideUserInterfaceStyle = .unspecified
-            return
-        }
-        let size = feed.bounds.size
-        guard size.width > 0, size.height > 0 else { return }
-        let center = CGPoint(x: actions.frame.midX, y: actions.frame.midY)
-        let contentY = feed.contentOffset.y + center.y
-        let page = max(0, Int(floor(contentY / size.height)))
-        let luminance = FeedCell.luminance(
-            page: page,
-            x: center.x / size.width,
-            y: (contentY - CGFloat(page) * size.height) / size.height
-        )
-        let style: UIUserInterfaceStyle = luminance > 0.18 ? .light : .dark
-        if actions.overrideUserInterfaceStyle != style {
-            actions.overrideUserInterfaceStyle = style
-        }
     }
 
     // MARK: Settings
@@ -1572,8 +1626,6 @@ private final class DouyinHomeViewController: UIViewController, UICollectionView
             view.setNeedsLayout()
         case LabKey.edgeEffect:
             applyEdgeEffect()
-        case LabKey.rightStyle:
-            applyRightStyle()
         case LabKey.bottomMinimize:
             applyBottomMinimize()
         case LabKey.appearance:
@@ -1836,14 +1888,9 @@ private final class LabSettingsViewController: UIViewController {
         stack.addArrangedSubview(header("右侧按钮"))
         stack.addArrangedSubview(segmentRow(
             "材质",
-            items: ["按钮R", "按钮C", "视图R", "视图C"],
+            items: ["按钮R", "按钮C", "视图R", "视图C", "栏按钮"],
             selected: LabSettings.rightMaterial
         ) { LabSettings.store($0, LabKey.rightMaterial) })
-        stack.addArrangedSubview(segmentRow(
-            "深浅",
-            items: ["跟随背景", "跟随窗口"],
-            selected: LabSettings.rightStyle
-        ) { LabSettings.store($0, LabKey.rightStyle) })
         stack.addArrangedSubview(sliderRow(
             "整体缩放（真实尺寸）",
             value: Double(LabSettings.rightScale),
