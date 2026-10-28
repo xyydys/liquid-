@@ -87,7 +87,10 @@ private final class PhotosSystemTabController: UITabBarController {
 
         LabProbe.shared.register("底栏") { [weak self] in self?.tabBar }
         if LabProbe.isEnabled {
-            LabProbe.shared.start()
+            // After the first frames, so the probe can never hold up launch.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                LabProbe.shared.start()
+            }
         }
     }
 }
@@ -2116,6 +2119,12 @@ private final class LabSettingsViewController: UIViewController {
 private final class LabProbe {
     static let shared = LabProbe()
     static let enabledKey = "lab.probe.enabled"
+    /// Holds the step being captured and is removed when the capture
+    /// finishes; still there at the next start means that step hung or
+    /// crashed the app. A file, so writing it posts no notification.
+    private let busyURL = FileManager.default
+        .urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("probe.busy")
 
     static var isEnabled: Bool {
         UserDefaults.standard.object(forKey: enabledKey) == nil
@@ -2162,6 +2171,12 @@ private final class LabProbe {
             lines = Array(saved.split(separator: "\n", omittingEmptySubsequences: false).suffix(3000).map(String.init))
         }
         log("====== 探针开始 · \(Date()) ======")
+        if let step = try? String(contentsOf: busyURL, encoding: .utf8) {
+            try? FileManager.default.removeItem(at: busyURL)
+            UserDefaults.standard.set(false, forKey: Self.enabledKey)
+            log("上次抓取卡在或闪退于：\(step)。探针已自动关闭，请把这段日志发回。")
+            return
+        }
         snapshot = capture()
         log("基线：" + snapshot.keys.sorted().map { "\($0) \(snapshot[$0]?.count ?? 0) 行" }.joined(separator: " · "))
         observer = NotificationCenter.default.addObserver(
@@ -2277,8 +2292,14 @@ private final class LabProbe {
 
     // MARK: Capture
 
+    private func step(_ name: String) {
+        try? name.data(using: .utf8)?.write(to: busyURL, options: .atomic)
+    }
+
     private func capture() -> [String: [String]] {
+        let started = Date()
         var result: [String: [String]] = [:]
+        step("全局默认值")
         result["全局默认值"] = Self.matchingDefaults()
         if let domain = Bundle.main.bundleIdentifier,
            let saved = UserDefaults.standard.persistentDomain(forName: domain) {
@@ -2298,15 +2319,23 @@ private final class LabProbe {
                 continue
             }
             window = window ?? view.window
+            step(region.name + "·特征")
             result[region.name + "·特征"] = Self.traitLines(view.traitCollection)
+            step(region.name + "·玻璃")
             result[region.name + "·玻璃"] = Self.glassLines(view)
         }
+        step("窗口·特征")
         if let window {
             result["窗口·特征"] = Self.traitLines(window.traitCollection)
                 + ["override=\(window.overrideUserInterfaceStyle.rawValue)"]
             if let scene = window.windowScene {
                 result["场景·特征"] = Self.traitLines(scene.traitCollection)
             }
+        }
+        try? FileManager.default.removeItem(at: busyURL)
+        let seconds = Date().timeIntervalSince(started)
+        if seconds > 0.3 {
+            log("（这次抓取用了 \(String(format: "%.2f", seconds)) 秒）")
         }
         return result
     }
@@ -2452,11 +2481,7 @@ private final class LabProbe {
                 switch encoding.first {
                 case "@":
                     if let item = object_getIvar(object, ivar) {
-                        if item is UIView || item is CALayer {
-                            value = "<\(String(describing: type(of: item)))>"
-                        } else {
-                            value = clean(String(describing: item), limit: 300)
-                        }
+                        value = describeSafely(item)
                     } else {
                         value = "nil"
                     }
@@ -2473,6 +2498,30 @@ private final class LabProbe {
             }
         }
         return out
+    }
+
+    /// Only value-like objects are described; anything else is named by its
+    /// class, since its description may run arbitrary code.
+    private static func describeSafely(_ item: Any) -> String {
+        guard let object = item as? NSObject else {
+            return "<\(String(describing: type(of: item)))>"
+        }
+        let name = NSStringFromClass(type(of: object))
+        let valueLike = object is NSString || object is NSNumber || object is NSValue
+            || object is UIColor || object is UIVisualEffect
+            || name.contains("CAFilter") || name.contains("GlassEffect")
+        if valueLike {
+            return clean(object.description, limit: 300)
+        }
+        if let array = object as? [AnyObject] {
+            return "[" + array.prefix(8).map { describeSafely($0) }.joined(separator: ", ") + "]"
+        }
+        if let dictionary = object as? [String: AnyObject] {
+            return "{" + dictionary.keys.sorted().prefix(16).map {
+                "\($0): \(describeSafely(dictionary[$0] as Any))"
+            }.joined(separator: ", ") + "}"
+        }
+        return "<\(name)>"
     }
 
     private static let addressPattern = try? NSRegularExpression(pattern: "0x[0-9a-fA-F]+")
